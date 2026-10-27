@@ -1,0 +1,40 @@
+{
+  "name": "car-parking-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "type-check": "tsc --noEmit",
+    "test": "tsx src/test/runAllTests.ts",
+    "test:emulator": "node src/test/runEmulatorTests.mjs",
+    "test:emulator:backend": "tsx src/test/phase5e1BackendEmulator.test.ts",
+    "test:emulator:callable": "tsx src/test/phase5f1CallableAndGuard.test.ts",
+    "test:emulator:rules": "tsx src/test/phase5g2SecurityRules.test.ts",
+    "test:emulator:services": "tsx src/test/phase5g3CoreServices.test.ts",
+    "emulator": "node src/test/startEmulatorBackground.mjs",
+    "seed": "tsx src/test/seedBrowserTestData.ts"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "firebase": "^10.14.1",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.5.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

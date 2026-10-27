@@ -1,0 +1,340 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Helper Functions: Authentication & Role Verification (SEC-03)
+    // -------------------------------------------------------------------------
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isExistingStaff() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/guards/$(request.auth.uid));
+    }
+
+    function getStaffData() {
+      return get(/databases/$(database)/documents/guards/$(request.auth.uid)).data;
+    }
+
+    function hasTokenRole(expectedRole) {
+      return isAuthenticated() &&
+        'role' in request.auth.token &&
+        request.auth.token.role != null &&
+        request.auth.token.role.lower() == expectedRole;
+    }
+
+    function hasTokenAdmin() {
+      return isAuthenticated() &&
+        'admin' in request.auth.token &&
+        request.auth.token.admin == true;
+    }
+
+    function isStaffWithRole(expectedRole) {
+      return isExistingStaff() &&
+        getStaffData().isActive == true &&
+        'role' in getStaffData() &&
+        getStaffData().role != null &&
+        getStaffData().role.lower() == expectedRole;
+    }
+
+    // Enterprise Owner evaluation (Phase 5B/5C/5D)
+    function isOwner() {
+      return isAuthenticated() && (
+        hasTokenRole('owner') ||
+        isStaffWithRole('owner')
+      );
+    }
+
+    // Enterprise Admin evaluation
+    function isAdmin() {
+      return isAuthenticated() && (
+        hasTokenAdmin() ||
+        hasTokenRole('admin') ||
+        isStaffWithRole('admin') ||
+        // Bootstrap development admin account fallback (with safe null checks)
+        ('email' in request.auth.token && 
+         request.auth.token.email != null && 
+         request.auth.token.email.lower() == 'vaibhavpawase143@gmail.com')
+      );
+    }
+
+    function isEnterpriseAdmin() {
+      return isOwner() || isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // Location Scoping Helper: Enforces tenant isolation per location
+    // -------------------------------------------------------------------------
+    function isAuthorizedForLocation(targetLocId) {
+      return isEnterpriseAdmin() || (
+        isExistingStaff() && getStaffData().isActive == true && (
+          // 1. Single assigned location for guards
+          ('assignedLocationId' in getStaffData() && getStaffData().assignedLocationId == targetLocId) ||
+          // 2. Multi-location assignments for managers or modern guards
+          ('assignedLocationIds' in getStaffData() && getStaffData().assignedLocationIds.hasAny([targetLocId])) ||
+          // 3. Narrow legacy compatibility: unassigned legacy staff profile defaults only to loc_sangamner_01
+          (targetLocId == 'loc_sangamner_01' && 
+           !('assignedLocationId' in getStaffData()) && 
+           !('assignedLocationIds' in getStaffData()))
+        )
+      );
+    }
+
+    // Scoping for operational records: historical records without locationId default strictly to Sangamner staff
+    function isAuthorizedForRecord(recordData) {
+      return ('locationId' in recordData && recordData.locationId != null)
+        ? isAuthorizedForLocation(recordData.locationId)
+        : isAuthorizedForLocation('loc_sangamner_01');
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Staff / Guards Registry Collection
+    // -------------------------------------------------------------------------
+    match /guards/{guardId} {
+      allow read: if isAuthenticated();
+
+      // Only Enterprise Admins / Owners can create staff accounts
+      allow create: if isEnterpriseAdmin();
+
+      // Enterprise Admins can update any staff profile.
+      // Staff members can update only their non-privileged fields;
+      // role, isActive, assigned locations, and ownerUid are strictly immutable on self-update.
+      allow update: if isEnterpriseAdmin() || (
+        isAuthenticated() && request.auth.uid == guardId &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.isActive == resource.data.isActive &&
+        (!('assignedLocationId' in resource.data) || request.resource.data.assignedLocationId == resource.data.assignedLocationId) &&
+        (!('assignedLocationIds' in resource.data) || request.resource.data.assignedLocationIds == resource.data.assignedLocationIds) &&
+        (!('ownerUid' in resource.data) || request.resource.data.ownerUid == resource.data.ownerUid)
+      );
+
+      // Deletions are strictly Enterprise Admin only
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. Shifts & Scheduling Collections
+    // -------------------------------------------------------------------------
+    match /shifts/{shiftId} {
+      allow read: if isAuthenticated() && (
+        isEnterpriseAdmin() ||
+        resource.data.guardUid == request.auth.uid ||
+        resource.data.guardId == request.auth.uid ||
+        isAuthorizedForRecord(resource.data)
+      );
+
+      allow create: if isEnterpriseAdmin() || (
+        isStaffWithRole('manager') && 
+        ('locationId' in request.resource.data && isAuthorizedForLocation(request.resource.data.locationId))
+      );
+
+      allow update: if isEnterpriseAdmin() || (
+        isStaffWithRole('manager') && 
+        isAuthorizedForRecord(resource.data) &&
+        (!('locationId' in request.resource.data) || request.resource.data.locationId == resource.data.locationId)
+      );
+
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    match /shift_schedules/{scheduleId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isEnterpriseAdmin() || isStaffWithRole('manager');
+    }
+
+    match /schedule_exceptions/{exceptionId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isEnterpriseAdmin() || isStaffWithRole('manager');
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. System Settings Configuration
+    // -------------------------------------------------------------------------
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Audit Logs (SEC-02 Hardened)
+    // -------------------------------------------------------------------------
+    match /audit_logs/{logId} {
+      // Enterprise Admins and Managers can read audit logs
+      allow read: if isEnterpriseAdmin() || isStaffWithRole('manager');
+      // Direct client creation, update, and deletion are strictly forbidden.
+      // Audit logs are created exclusively by trusted Cloud Functions using the Admin SDK.
+      allow create, update, delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. In-App Notifications
+    // -------------------------------------------------------------------------
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (
+        resource.data.recipientUserId == request.auth.uid ||
+        resource.data.recipientUserId == 'all' ||
+        (resource.data.recipientUserId == 'admin' && isEnterpriseAdmin()) ||
+        isEnterpriseAdmin()
+      );
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() && (
+        resource.data.recipientUserId == request.auth.uid ||
+        isEnterpriseAdmin()
+      );
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. Ticket Counters (Location-Scoped)
+    // -------------------------------------------------------------------------
+    match /counters/{counterId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (
+        isEnterpriseAdmin() || 
+        isStaffWithRole('guard') || 
+        isStaffWithRole('manager')
+      );
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Parking Records (SEC-03 Hardened)
+    // -------------------------------------------------------------------------
+    match /parking_records/{ticketId} {
+      // Scoped get: user must be authorized for this record's location (resource == null when doc does not exist)
+      allow get: if isAuthenticated() && (resource == null || isAuthorizedForRecord(resource.data));
+
+      // Scoped list: permitted for active staff to preserve operational queries during migration
+      allow list: if isAuthenticated() && (
+        isEnterpriseAdmin() || isStaffWithRole('guard') || isStaffWithRole('manager')
+      );
+
+      // Create: user must be active staff authorized for this location
+      allow create: if isAuthenticated() && 
+        (isEnterpriseAdmin() || isStaffWithRole('guard') || isStaffWithRole('manager')) &&
+        isAuthorizedForRecord(request.resource.data) &&
+        request.resource.data.status == 'ACTIVE';
+
+      // Update: active staff at location can settle exit; locationId cannot be altered
+      allow update: if isAuthenticated() && 
+        (isEnterpriseAdmin() || isStaffWithRole('guard') || isStaffWithRole('manager')) &&
+        isAuthorizedForRecord(resource.data) &&
+        (!('locationId' in request.resource.data) || !('locationId' in resource.data) || request.resource.data.locationId == resource.data.locationId);
+
+      // Deletions are strictly Enterprise Admin only
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. Payment Transactions (SEC-03 Hardened & Immutable Ledger)
+    // -------------------------------------------------------------------------
+    match /payment_transactions/{txnId} {
+      // Scoped read: user must be authorized for this location, or be the recording guard
+      allow read: if isAuthenticated() && (
+        isAuthorizedForRecord(resource.data) ||
+        resource.data.guardUid == request.auth.uid
+      );
+
+      // Create: active staff at location appending transaction
+      allow create: if isAuthenticated() && 
+        (isEnterpriseAdmin() || isStaffWithRole('guard') || isStaffWithRole('manager')) &&
+        (
+          ('locationId' in request.resource.data && request.resource.data.locationId != null)
+            ? isAuthorizedForLocation(request.resource.data.locationId)
+            : true
+        );
+
+      // Transactions are immutable ledger entries; updates restricted to Admin; deletions forbidden
+      allow update: if isEnterpriseAdmin();
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. Monthly Passes
+    // -------------------------------------------------------------------------
+    match /monthly_passes/{passId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isEnterpriseAdmin() || isStaffWithRole('manager');
+    }
+
+    // -------------------------------------------------------------------------
+    // 10. Financial Handovers
+    // -------------------------------------------------------------------------
+    match /handovers/{handoverId} {
+      allow read: if isAuthenticated() && (
+        isEnterpriseAdmin() ||
+        resource.data.fromGuardId == request.auth.uid ||
+        resource.data.toGuardId == request.auth.uid ||
+        isAuthorizedForRecord(resource.data)
+      );
+
+      allow create: if isAuthenticated() && (
+        isEnterpriseAdmin() || (
+          (request.resource.data.fromGuardId == request.auth.uid ||
+           ('fromGuardEmail' in request.resource.data && 'email' in request.auth.token && request.resource.data.fromGuardEmail == request.auth.token.email) ||
+           isStaffWithRole('guard')) &&
+          isAuthorizedForRecord(request.resource.data)
+        )
+      );
+
+      allow update: if isAuthenticated() && (
+        isEnterpriseAdmin() ||
+        (
+          resource.data.status == 'PENDING' &&
+          (
+            ((resource.data.toGuardId == request.auth.uid || 
+              ('toGuardEmail' in resource.data && 'email' in request.auth.token && resource.data.toGuardEmail == request.auth.token.email)) && 
+             request.resource.data.status in ['ACCEPTED', 'REJECTED'] &&
+             isAuthorizedForRecord(resource.data)) ||
+            ((resource.data.fromGuardId == request.auth.uid || 
+              ('fromGuardEmail' in resource.data && 'email' in request.auth.token && resource.data.fromGuardEmail == request.auth.token.email)) && 
+             request.resource.data.status == 'CANCELLED')
+          )
+        )
+      );
+
+      allow delete: if isEnterpriseAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 11. Admin Withdrawals & Responsibility Events
+    // -------------------------------------------------------------------------
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAuthenticated() && (isEnterpriseAdmin() || isAuthorizedForRecord(resource.data));
+      allow create: if isEnterpriseAdmin() || (
+        isStaffWithRole('manager') && isAuthorizedForRecord(request.resource.data)
+      );
+      allow update, delete: if false;
+    }
+
+    match /responsibility_events/{eventId} {
+      allow read: if isAuthenticated() && (
+        isEnterpriseAdmin() ||
+        resource.data.guardId == request.auth.uid ||
+        resource.data.targetGuardId == request.auth.uid ||
+        isAuthorizedForRecord(resource.data)
+      );
+      allow create: if isAuthenticated() && (
+        isEnterpriseAdmin() ||
+        request.resource.data.guardId == request.auth.uid ||
+        request.resource.data.targetGuardId == request.auth.uid
+      );
+      allow update, delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 12. Locations Registry & Code Reservation (Phase 5E: Client write denied)
+    // -------------------------------------------------------------------------
+    match /locations/{locationId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    match /location_codes/{code} {
+      allow read, write: if false;
+    }
+  }
+}
